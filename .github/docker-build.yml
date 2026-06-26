@@ -1,0 +1,108 @@
+name: Check Remote Release and Build
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Runs automatically every 6 hours
+  workflow_dispatch:      # Allows you to also trigger it manually from the UI
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      # Step 1: Fetch the latest release tag from the remote repository
+      - name: Get latest remote release
+        id: remote_version
+        run: |
+          LATEST_TAG=$(curl -s https://api.github.com/repos/tadelv/reaprime/releases/latest | jq -r '.tag_name')
+          echo "Latest remote release tag is: $LATEST_TAG"
+          if [ "$LATEST_TAG" = "null" ] || [ -z "$LATEST_TAG" ]; then
+            echo "No release found or API rate limit hit."
+            exit 1
+          fi
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+      # Step 2: Compare it against your own repo's local cache file to see if it's new
+      - name: Check out your automation repo
+        uses: actions/checkout@v4
+
+      - name: Verify if new version
+        id: check_new
+        run: |
+          VERSION_FILE="last_built_release.txt"
+          LOCAL_VERSION=""
+          if [ -f "$VERSION_FILE" ]; then
+            LOCAL_VERSION=$(cat $VERSION_FILE)
+          fi
+          
+          echo "Local cached version: $LOCAL_VERSION"
+          echo "Remote version: ${{ steps.remote_version.outputs.tag }}"
+          
+          if [ "$LOCAL_VERSION" = "${{ steps.remote_version.outputs.tag }}" ]; then
+            echo "No new release found. Skipping build."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "New release detected! Proceeding to build."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 3: Pull THEIR source code using the detected release tag
+      - name: Checkout target repository code
+        if: steps.check_new.outputs.should_build == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: tadelv/reaprime
+          ref: ${{ steps.remote_version.outputs.tag }}
+
+      # Step 4: Set up Docker
+      - name: Set up Docker Buildx
+        if: steps.check_new.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: steps.check_new.outputs.should_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 5: Extract tags (tagging it both 'latest' and with the remote release version)
+      - name: Extract Docker metadata
+        if: steps.check_new.outputs.should_build == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.remote_version.outputs.tag }}
+
+      # Step 6: Build and Push
+      - name: Build and push Docker image
+        if: steps.check_new.outputs.should_build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Step 7: Update your local cache file so it doesn't rebuild next time
+      - name: Update version cache file
+        if: steps.check_new.outputs.should_build == 'true'
+        run: |
+          # Re-checkout your own automation repository to commit the text file update
+          uses: actions/checkout@v4
+          echo "${{ steps.remote_version.outputs.tag }}" > last_built_release.txt
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_built_release.txt
+          git commit -m "Update cached release version to ${{ steps.remote_version.outputs.tag }} [skip ci]"
+          git push origin main
