@@ -1,9 +1,9 @@
-name: Check Remote Release and Build
+name: Check Remote Release and Build Runtime
 
 on:
   schedule:
     - cron: '0 */6 * * *' # Runs automatically every 6 hours
-  workflow_dispatch:      # Allows you to trigger it manually anytime
+  workflow_dispatch:      # Allows manual trigger
 
 permissions:
   contents: write
@@ -13,23 +13,22 @@ jobs:
   check-and-build:
     runs-on: ubuntu-latest
     steps:
-      # Step 1: Fetch the latest release tag from the remote repository
+      # Step 1: Get latest release metadata
       - name: Get latest remote release
         id: remote_version
         run: |
           LATEST_TAG=$(curl -s https://api.github.com/repos/tadelv/reaprime/releases/latest | jq -r '.tag_name')
+          # Remove 'v' prefix if it exists to get the raw version number (e.g., 0.7.9)
+          VERSION_NUM=$(echo "$LATEST_TAG" | sed 's/^v//')
           echo "Latest remote release tag is: $LATEST_TAG"
-          if [ "$LATEST_TAG" = "null" ] || [ -z "$LATEST_TAG" ]; then
-            echo "No release found or API rate limit hit."
-            exit 1
-          fi
           echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION_NUM" >> $GITHUB_OUTPUT
 
-      # Step 2: Check out your automation repo to read the cache file
+      # Step 2: Check out your automation tracking repo
       - name: Check out your automation repo
         uses: actions/checkout@v4
 
-      # Step 3: Verify if it's a new version
+      # Step 3: Verify if new version
       - name: Verify if new version
         id: check_new
         run: |
@@ -39,9 +38,6 @@ jobs:
             LOCAL_VERSION=$(cat $VERSION_FILE)
           fi
           
-          echo "Local cached version: $LOCAL_VERSION"
-          echo "Remote version: ${{ steps.remote_version.outputs.tag }}"
-          
           if [ "$LOCAL_VERSION" = "${{ steps.remote_version.outputs.tag }}" ]; then
             echo "No new release found. Skipping build."
             echo "should_build=false" >> $GITHUB_OUTPUT
@@ -50,20 +46,48 @@ jobs:
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
 
-      # Step 4: Clean directory and pull THEIR source code if needed
-      - name: Checkout target repository code
+      # Step 4: Dynamically generate the runtime Dockerfile
+      - name: Create Runtime Dockerfile
         if: steps.check_new.outputs.should_build == 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: tadelv/reaprime
-          ref: ${{ steps.remote_version.outputs.tag }}
+        run: |
+          cat << 'EOF' > Dockerfile
+          FROM ubuntu:22.04
 
-      # Step 5: Set up Docker Engine
+          # Prevent interactive prompts during package installs
+          ENV DEBIAN_FRONTEND=noninteractive
+
+          # Install essential Flutter Linux runtime dependencies and utilities
+          RUN apt-get update && apt-get install -y \
+              curl \
+              tar \
+              libgtk-3-0 \
+              libblkid1 \
+              liblzma5 \
+              libgcrypt20 \
+              libglib2.0-0 \
+              && rm -rf /var/lib/apt/lists/*
+
+          WORKDIR /app
+
+          # Download the specific release package based on build arguments
+          ARG VERSION
+          RUN curl -L -o decent.tar.gz "https://github.com/tadelv/reaprime/releases/download/v${VERSION}/decent-linux-x64-${VERSION}.tar.gz" \
+              && tar -xzf decent.tar.gz --strip-components=1 \
+              && rm decent.tar.gz
+
+          # Expose the API and skin server port
+          EXPOSE 8080
+
+          # Start the application binary directly
+          CMD ["./decent"]
+          EOF
+
+      # Step 5: Set up Docker Buildx
       - name: Set up Docker Buildx
         if: steps.check_new.outputs.should_build == 'true'
         uses: docker/setup-buildx-action@v3
 
-      # Step 6: Log into GitHub Container Registry
+      # Step 6: Log in to GHCR
       - name: Log in to GitHub Container Registry
         if: steps.check_new.outputs.should_build == 'true'
         uses: docker/login-action@v3
@@ -72,7 +96,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Step 7: Extract metadata for tags
+      # Step 7: Extract Metadata Tags
       - name: Extract Docker metadata
         if: steps.check_new.outputs.should_build == 'true'
         id: meta
@@ -83,7 +107,7 @@ jobs:
             type=raw,value=latest
             type=raw,value=${{ steps.remote_version.outputs.tag }}
 
-      # Step 8: Build and Push image
+      # Step 8: Build and Push utilizing the version argument
       - name: Build and push Docker image
         if: steps.check_new.outputs.should_build == 'true'
         uses: docker/build-push-action@v6
@@ -91,12 +115,14 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          build-args: |
+            VERSION=${{ steps.remote_version.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Step 9: Re-fetch your automation repo and write the new tag to cache
+      # Step 9: Commit updated version cache file back to your repo
       - name: Update version cache file
         if: steps.check_new.outputs.should_build == 'true'
         run: |
