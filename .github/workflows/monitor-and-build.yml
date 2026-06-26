@@ -122,20 +122,10 @@ jobs:
           cache-to: type=gha,mode=max
 
 # Step 9: Re-fetch your automation repo and write the new tag to cache
+# Step 9: Safe cache update using an official action
       - name: Update version cache file
         if: steps.check_new.outputs.should_build == 'true'
-        run: |
-          git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git tracking-repo
-          cd tracking-repo
-          echo "${{ steps.remote_version.outputs.tag }}" > last_built_release.txt
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add last_built_release.txt
-          
-          # Only commit and push if changes actually exist in the working directory
-          if ! git diff-index --quiet HEAD; then
-            git commit -m "Update cached release version to ${{ steps.remote_version.outputs.tag }} [skip ci]"
-            git push origin main
-          else
-            echo "No file changes detected. Skipping cache commit."
-          fi
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update cached release version to ${{ steps.remote_version.outputs.tag }} [skip ci]"
+          file_pattern: 'last_built_release.txt'
